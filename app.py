@@ -33,6 +33,7 @@ PAGE_WAIT_FOR_PAPS_MS = 10000
 PAGE_WAIT_FOR_PAPS_RETRY_MS = 15000
 PAGE_GOTO_MAX_RETRIES = 2
 MAX_EVENTS_PER_ROUTE = 30
+ROUTE_DIAGNOSTIC_RETENTION_HOURS = 5
 MEMORY_SNAPSHOT_LIMIT = 200
 MEMORY_SNAPSHOTS = deque(maxlen=MEMORY_SNAPSHOT_LIMIT)
 SCRAPE_SUBPROCESS_TIMEOUT_SEC = 11 * 60
@@ -259,6 +260,28 @@ def prune_route_states(route_states, now, tz):
             stale_urls.append(source_url)
     for source_url in stale_urls:
         route_states.pop(source_url, None)
+
+
+def cleanup_route_diagnostics(route_states, now, tz):
+    """
+    清理超过保留时长的线路诊断字段，避免排错数据长期占用内存与状态文件。
+    不影响核心抓取结果字段（id/source_url/stream_url/match_time 等）。
+    """
+    cutoff = now - timedelta(hours=ROUTE_DIAGNOSTIC_RETENTION_HOURS)
+    for state in route_states.values():
+        checked_at = state.get("last_checked_at")
+        if not checked_at:
+            continue
+        try:
+            checked_dt = tz.localize(datetime.strptime(checked_at, "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            continue
+
+        if checked_dt < cutoff:
+            state["events"] = []
+            state["last_error"] = None
+            state["last_request_count"] = 0
+            state["last_seen_paps_url"] = None
 
 # ==========================================
 # 爬虫任务逻辑
@@ -604,6 +627,7 @@ def scrape_job_once(run_label=None):
             for item in final_data:
                 f.write(json.dumps(item, ensure_ascii=False) + '\n')
         prune_route_states(route_states, now, tz)
+        cleanup_route_diagnostics(route_states, now, tz)
         save_route_states(route_states)
         
         print(f"任务完成，共保存 {len(final_data)} 个记录。")
