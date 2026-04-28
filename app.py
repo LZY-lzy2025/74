@@ -18,6 +18,8 @@ from requests.adapters import HTTPAdapter
 import ctypes
 import resource
 from collections import deque
+import subprocess
+import sys
 
 app = Flask(__name__)
 OUTPUT_FILE = 'output/extracted_ids.txt'
@@ -33,6 +35,7 @@ PAGE_GOTO_MAX_RETRIES = 2
 MAX_EVENTS_PER_ROUTE = 30
 MEMORY_SNAPSHOT_LIMIT = 200
 MEMORY_SNAPSHOTS = deque(maxlen=MEMORY_SNAPSHOT_LIMIT)
+SCRAPE_SUBPROCESS_TIMEOUT_SEC = 11 * 60
 
 
 def release_memory():
@@ -260,18 +263,13 @@ def prune_route_states(route_states, now, tz):
 # ==========================================
 # 爬虫任务逻辑
 # ==========================================
-def scrape_job():
-    if not SCRAPE_JOB_LOCK.acquire(blocking=False):
-        print("上一次抓取任务仍在执行，跳过本轮调度。")
-        return
-
-    global LAST_RUN_TIME
+def scrape_job_once(run_label=None):
+    tz = pytz.timezone('Asia/Shanghai')
+    now = datetime.now(tz)
+    run_label = run_label or now.strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{run_label}] 开始执行抓取任务...")
+    log_memory_snapshot("start", run_label)
     try:
-        tz = pytz.timezone('Asia/Shanghai')
-        now = datetime.now(tz)
-        LAST_RUN_TIME = now.strftime('%Y-%m-%d %H:%M:%S')
-        print(f"[{LAST_RUN_TIME}] 开始执行抓取任务...")
-        log_memory_snapshot("start", LAST_RUN_TIME)
         
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -610,10 +608,43 @@ def scrape_job():
         
         print(f"任务完成，共保存 {len(final_data)} 个记录。")
         release_memory()
-        log_memory_snapshot("after_release", LAST_RUN_TIME)
+        log_memory_snapshot("after_release", run_label)
     finally:
         release_memory()
-        log_memory_snapshot("finally_release", LAST_RUN_TIME)
+        log_memory_snapshot("finally_release", run_label)
+
+
+def scrape_job():
+    if not SCRAPE_JOB_LOCK.acquire(blocking=False):
+        print("上一次抓取任务仍在执行，跳过本轮调度。")
+        return
+
+    global LAST_RUN_TIME
+    try:
+        tz = pytz.timezone('Asia/Shanghai')
+        now = datetime.now(tz)
+        LAST_RUN_TIME = now.strftime('%Y-%m-%d %H:%M:%S')
+        log_memory_snapshot("scheduler_start", LAST_RUN_TIME)
+
+        env = os.environ.copy()
+        env["SCRAPE_ONCE"] = "1"
+        env["SCRAPE_RUN_LABEL"] = LAST_RUN_TIME
+
+        try:
+            result = subprocess.run(
+                [sys.executable, os.path.abspath(__file__)],
+                env=env,
+                timeout=SCRAPE_SUBPROCESS_TIMEOUT_SEC
+            )
+            log_memory_snapshot("scheduler_after_subprocess", LAST_RUN_TIME)
+            if result.returncode != 0:
+                print(f"抓取子进程退出异常，exit_code={result.returncode}")
+        except subprocess.TimeoutExpired:
+            print(f"抓取子进程超时（>{SCRAPE_SUBPROCESS_TIMEOUT_SEC}秒），已终止本轮。")
+            log_memory_snapshot("scheduler_timeout", LAST_RUN_TIME)
+    finally:
+        release_memory()
+        log_memory_snapshot("scheduler_finally", LAST_RUN_TIME)
         SCRAPE_JOB_LOCK.release()
 
 # ==========================================
@@ -701,6 +732,10 @@ def get_txt_plus():
     return Response(generate_playlist("txt", "plus"), mimetype='text/plain; charset=utf-8', headers={"Access-Control-Allow-Origin": "*"})
 
 if __name__ == "__main__":
+    if os.getenv("SCRAPE_ONCE") == "1":
+        scrape_job_once(os.getenv("SCRAPE_RUN_LABEL"))
+        raise SystemExit(0)
+
     scheduler = BackgroundScheduler(
         timezone="Asia/Shanghai",
         executors={"default": {"type": "threadpool", "max_workers": 1}},
