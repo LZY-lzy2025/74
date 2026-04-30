@@ -114,6 +114,50 @@ def is_pid_alive(pid):
         return True
     return False
 
+
+def collect_top_process_rss(top_n=8):
+    """采集容器内各进程RSS，用于定位“非主进程”内存来源。"""
+    processes = []
+    for pid_name in os.listdir("/proc"):
+        if not pid_name.isdigit():
+            continue
+        pid = int(pid_name)
+        status_path = f"/proc/{pid}/status"
+        cmdline_path = f"/proc/{pid}/cmdline"
+        rss_mb = None
+        proc_name = None
+
+        with suppress(Exception):
+            with open(status_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("Name:"):
+                        proc_name = line.split(":", 1)[1].strip()
+                    elif line.startswith("VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            rss_mb = round(int(parts[1]) / 1024, 2)
+
+        if rss_mb is None:
+            continue
+
+        cmdline = ""
+        with suppress(Exception):
+            with open(cmdline_path, "rb") as f:
+                raw = f.read().replace(b"\x00", b" ").strip()
+                cmdline = raw.decode("utf-8", errors="ignore")
+        if not cmdline:
+            cmdline = proc_name or ""
+
+        processes.append({
+            "pid": pid,
+            "name": proc_name,
+            "rss_mb": rss_mb,
+            "cmdline": cmdline[:180]
+        })
+
+    processes.sort(key=lambda x: x["rss_mb"], reverse=True)
+    return processes[:top_n]
+
 # ==========================================
 # 核心：内置轻量级 XXTEA 解密算法
 # ==========================================
@@ -768,7 +812,7 @@ def index():
     return jsonify({
         "status": "running",
         "last_run_time": LAST_RUN_TIME,
-        "endpoints": ["/ids", "/m3u", "/m3u_plus", "/txt", "/txt_plus", "/memory_stats"]
+        "endpoints": ["/ids", "/m3u", "/m3u_plus", "/txt", "/txt_plus", "/memory_stats", "/memory_sources"]
     })
 
 @app.route('/memory_stats')
@@ -788,6 +832,23 @@ def get_memory_stats():
         },
         "snapshot_limit": MEMORY_SNAPSHOT_LIMIT,
         "snapshots": list(MEMORY_SNAPSHOTS)
+    })
+
+
+@app.route('/memory_sources')
+def get_memory_sources():
+    """返回容器内主要进程RSS分布，辅助定位容器内存来源。"""
+    current_rss = get_rss_mb()
+    cgroup_usage_mb = read_cgroup_memory_mb()
+    top_processes = collect_top_process_rss(top_n=12)
+    top_sum_mb = round(sum(item["rss_mb"] for item in top_processes), 2) if top_processes else 0.0
+
+    return jsonify({
+        "last_run_time": LAST_RUN_TIME,
+        "current_rss_mb": current_rss if current_rss >= 0 else None,
+        "cgroup_memory_usage_mb": cgroup_usage_mb,
+        "top_processes_rss_mb": top_processes,
+        "top_processes_rss_sum_mb": top_sum_mb
     })
 
 @app.route('/m3u')
