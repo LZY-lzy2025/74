@@ -37,6 +37,8 @@ ROUTE_DIAGNOSTIC_RETENTION_HOURS = 5
 MEMORY_SNAPSHOT_LIMIT = 200
 MEMORY_SNAPSHOTS = deque(maxlen=MEMORY_SNAPSHOT_LIMIT)
 SCRAPE_SUBPROCESS_TIMEOUT_SEC = 11 * 60
+LAST_SUBPROCESS_PID = None
+LAST_SUBPROCESS_STARTED_AT = None
 
 
 def release_memory():
@@ -75,6 +77,42 @@ def log_memory_snapshot(stage, run_at):
     }
     MEMORY_SNAPSHOTS.append(snapshot)
     return snapshot
+
+
+def read_cgroup_memory_mb():
+    """读取容器(cgroup)内存占用，优先兼容 cgroup v2，再回退 v1。"""
+    for candidate in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        with suppress(Exception):
+            with open(candidate, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                if raw:
+                    return round(int(raw) / (1024 * 1024), 2)
+    return None
+
+
+def read_cgroup_memory_limit_mb():
+    """读取容器(cgroup)内存上限，无法识别时返回 None。"""
+    for candidate in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        with suppress(Exception):
+            with open(candidate, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                if not raw or raw == "max":
+                    return None
+                limit_bytes = int(raw)
+                # 极大值一般代表未限制，按未知处理
+                if limit_bytes <= 0 or limit_bytes >= (1 << 60):
+                    return None
+                return round(limit_bytes / (1024 * 1024), 2)
+    return None
+
+
+def is_pid_alive(pid):
+    if not pid:
+        return False
+    with suppress(Exception):
+        os.kill(pid, 0)
+        return True
+    return False
 
 # ==========================================
 # 核心：内置轻量级 XXTEA 解密算法
@@ -643,7 +681,7 @@ def scrape_job():
         print("上一次抓取任务仍在执行，跳过本轮调度。")
         return
 
-    global LAST_RUN_TIME
+    global LAST_RUN_TIME, LAST_SUBPROCESS_PID, LAST_SUBPROCESS_STARTED_AT
     try:
         tz = pytz.timezone('Asia/Shanghai')
         now = datetime.now(tz)
@@ -655,17 +693,21 @@ def scrape_job():
         env["SCRAPE_RUN_LABEL"] = LAST_RUN_TIME
 
         try:
-            result = subprocess.run(
-                [sys.executable, os.path.abspath(__file__)],
-                env=env,
-                timeout=SCRAPE_SUBPROCESS_TIMEOUT_SEC
-            )
+            proc = subprocess.Popen([sys.executable, os.path.abspath(__file__)], env=env)
+            LAST_SUBPROCESS_PID = proc.pid
+            LAST_SUBPROCESS_STARTED_AT = LAST_RUN_TIME
+            result = proc.wait(timeout=SCRAPE_SUBPROCESS_TIMEOUT_SEC)
             log_memory_snapshot("scheduler_after_subprocess", LAST_RUN_TIME)
-            if result.returncode != 0:
-                print(f"抓取子进程退出异常，exit_code={result.returncode}")
+            if result != 0:
+                print(f"抓取子进程退出异常，exit_code={result}")
         except subprocess.TimeoutExpired:
             print(f"抓取子进程超时（>{SCRAPE_SUBPROCESS_TIMEOUT_SEC}秒），已终止本轮。")
+            with suppress(Exception):
+                proc.kill()
+                proc.wait(timeout=5)
             log_memory_snapshot("scheduler_timeout", LAST_RUN_TIME)
+        finally:
+            LAST_SUBPROCESS_PID = None
     finally:
         release_memory()
         log_memory_snapshot("scheduler_finally", LAST_RUN_TIME)
@@ -732,9 +774,18 @@ def index():
 @app.route('/memory_stats')
 def get_memory_stats():
     current_rss = get_rss_mb()
+    cgroup_usage_mb = read_cgroup_memory_mb()
+    cgroup_limit_mb = read_cgroup_memory_limit_mb()
     return jsonify({
         "last_run_time": LAST_RUN_TIME,
         "current_rss_mb": current_rss if current_rss >= 0 else None,
+        "cgroup_memory_usage_mb": cgroup_usage_mb,
+        "cgroup_memory_limit_mb": cgroup_limit_mb,
+        "subprocess": {
+            "pid": LAST_SUBPROCESS_PID,
+            "is_running": is_pid_alive(LAST_SUBPROCESS_PID),
+            "started_at": LAST_SUBPROCESS_STARTED_AT
+        },
         "snapshot_limit": MEMORY_SNAPSHOT_LIMIT,
         "snapshots": list(MEMORY_SNAPSHOTS)
     })
