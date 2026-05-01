@@ -106,6 +106,42 @@ def read_cgroup_memory_limit_mb():
     return None
 
 
+def read_cgroup_memory_breakdown_mb():
+    """读取 cgroup memory.stat 并返回常见内存分类（MB）。"""
+    candidates = (
+        "/sys/fs/cgroup/memory.stat",
+        "/sys/fs/cgroup/memory/memory.stat"
+    )
+    stat_map = {}
+    for path in candidates:
+        with suppress(Exception):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) == 2:
+                        key, value = parts
+                        with suppress(Exception):
+                            stat_map[key] = int(value)
+            if stat_map:
+                break
+
+    if not stat_map:
+        return None
+
+    keys = [
+        "anon", "file", "kernel", "kernel_stack", "pagetables", "slab",
+        "slab_reclaimable", "slab_unreclaimable", "sock", "shmem",
+        "file_mapped", "file_dirty", "file_writeback", "inactive_anon",
+        "active_anon", "inactive_file", "active_file", "unevictable"
+    ]
+
+    result = {}
+    for key in keys:
+        if key in stat_map:
+            result[key] = round(stat_map[key] / (1024 * 1024), 2)
+    return result
+
+
 def is_pid_alive(pid):
     if not pid:
         return False
@@ -812,7 +848,7 @@ def index():
     return jsonify({
         "status": "running",
         "last_run_time": LAST_RUN_TIME,
-        "endpoints": ["/ids", "/m3u", "/m3u_plus", "/txt", "/txt_plus", "/memory_stats", "/memory_sources"]
+        "endpoints": ["/ids", "/m3u", "/m3u_plus", "/txt", "/txt_plus", "/memory_stats", "/memory_sources", "/memory_cgroup_breakdown"]
     })
 
 @app.route('/memory_stats')
@@ -849,6 +885,17 @@ def get_memory_sources():
         "cgroup_memory_usage_mb": cgroup_usage_mb,
         "top_processes_rss_mb": top_processes,
         "top_processes_rss_sum_mb": top_sum_mb
+    })
+
+
+@app.route('/memory_cgroup_breakdown')
+def get_memory_cgroup_breakdown():
+    breakdown = read_cgroup_memory_breakdown_mb()
+    return jsonify({
+        "last_run_time": LAST_RUN_TIME,
+        "cgroup_memory_usage_mb": read_cgroup_memory_mb(),
+        "cgroup_memory_limit_mb": read_cgroup_memory_limit_mb(),
+        "breakdown_mb": breakdown
     })
 
 @app.route('/m3u')
