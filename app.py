@@ -39,9 +39,9 @@ MEMORY_SNAPSHOTS = deque(maxlen=MEMORY_SNAPSHOT_LIMIT)
 SCRAPE_SUBPROCESS_TIMEOUT_SEC = 11 * 60
 LAST_SUBPROCESS_PID = None
 LAST_SUBPROCESS_STARTED_AT = None
-LAST_RECLAIM_AT = None
-RECLAIM_INTERVAL_HOURS = 3
-RECLAIM_AMOUNT_MB = 20
+RESTART_MEMORY_THRESHOLD_MB = 165.0
+RESTART_HOLD_SECONDS = 10 * 60
+HIGH_MEMORY_SINCE = None
 
 
 def release_memory():
@@ -145,34 +145,6 @@ def read_cgroup_memory_breakdown_mb():
     return result
 
 
-def try_reclaim_cgroup_file_cache(now_label):
-    """
-    在 cgroup v2 环境尝试按需回收内存（主要影响 file cache）。
-    不使用全局 drop_caches，避免影响宿主机其它工作负载。
-    """
-    global LAST_RECLAIM_AT
-    usage_mb = read_cgroup_memory_mb()
-    if usage_mb is None:
-        return False, "usage_unknown"
-
-    now_ts = datetime.utcnow()
-    if LAST_RECLAIM_AT is not None:
-        elapsed = now_ts - LAST_RECLAIM_AT
-        if elapsed < timedelta(hours=RECLAIM_INTERVAL_HOURS):
-            return False, f"interval_not_reached:{round(elapsed.total_seconds(), 1)}s"
-
-    reclaim_path = "/sys/fs/cgroup/memory.reclaim"
-    reclaim_bytes = RECLAIM_AMOUNT_MB * 1024 * 1024
-    try:
-        with open(reclaim_path, "w", encoding="utf-8") as f:
-            f.write(str(reclaim_bytes))
-        LAST_RECLAIM_AT = now_ts
-        log_memory_snapshot("scheduler_reclaim_attempted", now_label)
-        return True, f"reclaimed:{RECLAIM_AMOUNT_MB}MB"
-    except Exception as e:
-        return False, f"reclaim_failed:{e}"
-
-
 def is_pid_alive(pid):
     if not pid:
         return False
@@ -180,6 +152,30 @@ def is_pid_alive(pid):
         os.kill(pid, 0)
         return True
     return False
+
+
+def maybe_restart_on_high_memory():
+    """当 cgroup 内存持续超过阈值一段时间后主动退出，交由平台拉起新实例。"""
+    global HIGH_MEMORY_SINCE
+    usage_mb = read_cgroup_memory_mb()
+    if usage_mb is None:
+        HIGH_MEMORY_SINCE = None
+        return
+
+    now_ts = datetime.utcnow()
+    if usage_mb >= RESTART_MEMORY_THRESHOLD_MB:
+        if HIGH_MEMORY_SINCE is None:
+            HIGH_MEMORY_SINCE = now_ts
+            return
+        held_seconds = (now_ts - HIGH_MEMORY_SINCE).total_seconds()
+        if held_seconds >= RESTART_HOLD_SECONDS:
+            print(
+                f"内存保护触发重启: cgroup={usage_mb}MB, "
+                f"threshold={RESTART_MEMORY_THRESHOLD_MB}MB, held={int(held_seconds)}s"
+            )
+            os._exit(137)
+    else:
+        HIGH_MEMORY_SINCE = None
 
 
 def collect_top_process_rss(top_n=8):
@@ -820,13 +816,9 @@ def scrape_job():
         finally:
             LAST_SUBPROCESS_PID = None
     finally:
-        reclaimed, reclaim_msg = try_reclaim_cgroup_file_cache(LAST_RUN_TIME)
-        if reclaimed:
-            print(f"已尝试回收 cgroup 文件缓存: {reclaim_msg}")
-        elif reclaim_msg.startswith("reclaim_failed"):
-            print(f"cgroup 回收失败: {reclaim_msg}")
         release_memory()
         log_memory_snapshot("scheduler_finally", LAST_RUN_TIME)
+        maybe_restart_on_high_memory()
         SCRAPE_JOB_LOCK.release()
 
 # ==========================================
@@ -884,54 +876,7 @@ def index():
     return jsonify({
         "status": "running",
         "last_run_time": LAST_RUN_TIME,
-        "endpoints": ["/ids", "/m3u", "/m3u_plus", "/txt", "/txt_plus", "/memory_stats", "/memory_sources", "/memory_cgroup_breakdown"]
-    })
-
-@app.route('/memory_stats')
-def get_memory_stats():
-    current_rss = get_rss_mb()
-    cgroup_usage_mb = read_cgroup_memory_mb()
-    cgroup_limit_mb = read_cgroup_memory_limit_mb()
-    return jsonify({
-        "last_run_time": LAST_RUN_TIME,
-        "current_rss_mb": current_rss if current_rss >= 0 else None,
-        "cgroup_memory_usage_mb": cgroup_usage_mb,
-        "cgroup_memory_limit_mb": cgroup_limit_mb,
-        "subprocess": {
-            "pid": LAST_SUBPROCESS_PID,
-            "is_running": is_pid_alive(LAST_SUBPROCESS_PID),
-            "started_at": LAST_SUBPROCESS_STARTED_AT
-        },
-        "snapshot_limit": MEMORY_SNAPSHOT_LIMIT,
-        "snapshots": list(MEMORY_SNAPSHOTS)
-    })
-
-
-@app.route('/memory_sources')
-def get_memory_sources():
-    """返回容器内主要进程RSS分布，辅助定位容器内存来源。"""
-    current_rss = get_rss_mb()
-    cgroup_usage_mb = read_cgroup_memory_mb()
-    top_processes = collect_top_process_rss(top_n=12)
-    top_sum_mb = round(sum(item["rss_mb"] for item in top_processes), 2) if top_processes else 0.0
-
-    return jsonify({
-        "last_run_time": LAST_RUN_TIME,
-        "current_rss_mb": current_rss if current_rss >= 0 else None,
-        "cgroup_memory_usage_mb": cgroup_usage_mb,
-        "top_processes_rss_mb": top_processes,
-        "top_processes_rss_sum_mb": top_sum_mb
-    })
-
-
-@app.route('/memory_cgroup_breakdown')
-def get_memory_cgroup_breakdown():
-    breakdown = read_cgroup_memory_breakdown_mb()
-    return jsonify({
-        "last_run_time": LAST_RUN_TIME,
-        "cgroup_memory_usage_mb": read_cgroup_memory_mb(),
-        "cgroup_memory_limit_mb": read_cgroup_memory_limit_mb(),
-        "breakdown_mb": breakdown
+        "endpoints": ["/ids", "/m3u", "/m3u_plus", "/txt", "/txt_plus"]
     })
 
 @app.route('/m3u')
