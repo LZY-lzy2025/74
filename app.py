@@ -39,9 +39,9 @@ MEMORY_SNAPSHOTS = deque(maxlen=MEMORY_SNAPSHOT_LIMIT)
 SCRAPE_SUBPROCESS_TIMEOUT_SEC = 11 * 60
 LAST_SUBPROCESS_PID = None
 LAST_SUBPROCESS_STARTED_AT = None
-CGROUP_RECLAIM_ENABLED = os.getenv("CGROUP_RECLAIM_ENABLED", "0") == "1"
-CGROUP_RECLAIM_THRESHOLD_MB = float(os.getenv("CGROUP_RECLAIM_THRESHOLD_MB", "170"))
-CGROUP_RECLAIM_AMOUNT_MB = int(os.getenv("CGROUP_RECLAIM_AMOUNT_MB", "64"))
+LAST_RECLAIM_AT = None
+RECLAIM_INTERVAL_HOURS = 3
+RECLAIM_AMOUNT_MB = 20
 
 
 def release_memory():
@@ -150,22 +150,25 @@ def try_reclaim_cgroup_file_cache(now_label):
     在 cgroup v2 环境尝试按需回收内存（主要影响 file cache）。
     不使用全局 drop_caches，避免影响宿主机其它工作负载。
     """
-    if not CGROUP_RECLAIM_ENABLED:
-        return False, "disabled"
-
+    global LAST_RECLAIM_AT
     usage_mb = read_cgroup_memory_mb()
     if usage_mb is None:
         return False, "usage_unknown"
-    if usage_mb < CGROUP_RECLAIM_THRESHOLD_MB:
-        return False, f"below_threshold:{usage_mb}"
+
+    now_ts = datetime.utcnow()
+    if LAST_RECLAIM_AT is not None:
+        elapsed = now_ts - LAST_RECLAIM_AT
+        if elapsed < timedelta(hours=RECLAIM_INTERVAL_HOURS):
+            return False, f"interval_not_reached:{round(elapsed.total_seconds(), 1)}s"
 
     reclaim_path = "/sys/fs/cgroup/memory.reclaim"
-    reclaim_bytes = CGROUP_RECLAIM_AMOUNT_MB * 1024 * 1024
+    reclaim_bytes = RECLAIM_AMOUNT_MB * 1024 * 1024
     try:
         with open(reclaim_path, "w", encoding="utf-8") as f:
             f.write(str(reclaim_bytes))
+        LAST_RECLAIM_AT = now_ts
         log_memory_snapshot("scheduler_reclaim_attempted", now_label)
-        return True, f"reclaimed:{CGROUP_RECLAIM_AMOUNT_MB}MB"
+        return True, f"reclaimed:{RECLAIM_AMOUNT_MB}MB"
     except Exception as e:
         return False, f"reclaim_failed:{e}"
 
